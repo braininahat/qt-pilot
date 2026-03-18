@@ -4,6 +4,12 @@ from __future__ import annotations
 
 import builtins
 
+try:
+    from shiboken6 import isValid as _isValid
+except ImportError:
+    def _isValid(obj: object) -> bool:
+        return True
+
 
 class RefRegistry:
     """Ephemeral ref-to-object mapping, rebuilt on each snapshot."""
@@ -40,11 +46,10 @@ class RefRegistry:
 
     def resolve_or_raise(self, ref: str) -> object:
         obj = self._refs.get(ref)
-        if obj is None:
+        if obj is None or not _isValid(obj):
             raise ValueError(
-                f"Ref {ref} not found — it may have expired. "
-                f"Run `qt-pilot snapshot` to get fresh refs "
-                f"(current generation: {self._generation})"
+                f"Ref {ref} not found or destroyed — run `qt-pilot snapshot` "
+                f"to get fresh refs (current generation: {self._generation})"
             )
         return obj
 

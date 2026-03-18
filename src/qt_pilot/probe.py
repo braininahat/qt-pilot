@@ -16,7 +16,9 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QKeyEvent, QMouseEvent
 from PySide6.QtQuick import QQuickItem, QQuickWindow
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
+from shiboken6 import isValid
 
 from qt_pilot.registry import RefRegistry
 
@@ -46,21 +48,32 @@ class Probe(QObject):
         self._engine = engine
         self._registry = RefRegistry()
         self._shot_counter = 0
-        # Cache for annotated screenshot legend
         self._ref_info: list[tuple[str, str, str | None, QRectF]] = []
+        self.__window: QQuickWindow | None = None
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Window access — lazy, self-healing on C++ object invalidation
     # ------------------------------------------------------------------
 
-    def _root_window(self) -> QQuickWindow:
-        roots = self._engine.rootObjects()
-        if not roots:
-            raise RuntimeError("No root objects in QML engine")
-        root = roots[0]
-        if isinstance(root, QQuickWindow):
-            return root
-        raise RuntimeError(f"Root object is {type(root).__name__}, expected QQuickWindow")
+    @property
+    def _window(self) -> QQuickWindow:
+        """Get the root QQuickWindow, re-acquiring if the C++ object died.
+
+        PySide6/shiboken6 can invalidate the Python wrapper for the
+        ApplicationWindow after StackView transitions or event injection.
+        This property re-acquires from rootObjects() when that happens.
+        """
+        if self.__window is not None and isValid(self.__window):
+            return self.__window
+        for root in self._engine.rootObjects():
+            if isValid(root) and isinstance(root, QQuickWindow):
+                self.__window = root
+                return root
+        raise RuntimeError("No valid QQuickWindow in engine root objects")
+
+    def _invalidate_window(self) -> None:
+        """Force re-acquisition on next access."""
+        self.__window = None
 
     @staticmethod
     def _display_cls(item: QQuickItem) -> str:
@@ -104,15 +117,20 @@ class Probe(QObject):
 
     def snapshot(self, interactive_only: bool = False) -> dict:
         """Walk QML visual tree, assign refs, return text snapshot."""
-        window = self._root_window()
+        try:
+            return self._snapshot_impl(interactive_only)
+        except RuntimeError:
+            self._invalidate_window()
+            return self._snapshot_impl(interactive_only)
+
+    def _snapshot_impl(self, interactive_only: bool) -> dict:
+        window = self._window
         content = window.contentItem()
         self._registry.clear()
         self._ref_info.clear()
         lines: list[str] = []
 
-        # Header with page context
-        root = self._engine.rootObjects()[0]
-        page = root.property("currentPage")
+        page = window.property("currentPage")
         header_parts = []
         if page:
             header_parts.append(f"[page: {page}]")
@@ -125,16 +143,21 @@ class Probe(QObject):
 
     def _walk_item(self, item: QQuickItem, depth: int,
                    interactive_only: bool, lines: list[str]) -> None:
+        if not isValid(item):
+            return
         try:
             if not item.isVisible() or item.width() <= 0 or item.height() <= 0:
                 return
         except RuntimeError:
             return  # C++ object deleted
 
-        display_cls = self._display_cls(item)
-        is_interactive = self._is_interactive(display_cls)
-        text = self._read_text(item)
-        scene_rect = self._scene_rect(item)
+        try:
+            display_cls = self._display_cls(item)
+            is_interactive = self._is_interactive(display_cls)
+            text = self._read_text(item)
+            scene_rect = self._scene_rect(item)
+        except RuntimeError:
+            return
 
         if is_interactive:
             ref = self._registry.register(item)
@@ -175,8 +198,13 @@ class Probe(QObject):
 
     def screenshot(self, path: str | None = None, annotate: bool = False) -> dict:
         """Grab window contents as PNG."""
-        window = self._root_window()
-        image = window.grabWindow()
+        try:
+            window = self._window
+            image = window.grabWindow()
+        except RuntimeError:
+            self._invalidate_window()
+            window = self._window
+            image = window.grabWindow()
 
         if image.isNull():
             raise RuntimeError("grabWindow() returned null image")
@@ -226,20 +254,10 @@ class Probe(QObject):
 
         center = QPointF(item.width() / 2, item.height() / 2)
         scene_pos = item.mapToScene(center)
-        global_pos = QPointF(window.mapToGlobal(scene_pos.toPoint()))
 
-        press = QMouseEvent(
-            QEvent.Type.MouseButtonPress, scene_pos, global_pos,
-            Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
-            Qt.KeyboardModifier.NoModifier,
-        )
-        release = QMouseEvent(
-            QEvent.Type.MouseButtonRelease, scene_pos, global_pos,
-            Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton,
-            Qt.KeyboardModifier.NoModifier,
-        )
-        QApplication.sendEvent(window, press)
-        QApplication.sendEvent(window, release)
+        QTest.mouseClick(window, Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier,
+                         scene_pos.toPoint())
         QApplication.processEvents()
         return {"ok": True}
 
@@ -308,7 +326,7 @@ class Probe(QObject):
             window = item.window()
             item.forceActiveFocus()
         else:
-            window = self._root_window()
+            window = self._window
 
         qt_key, qt_mods, text = _parse_key(key)
         self._send_key(window, qt_key, qt_mods, text)
@@ -319,7 +337,7 @@ class Probe(QObject):
         """Scroll the window."""
         from PySide6.QtGui import QWheelEvent
 
-        window = self._root_window()
+        window = self._window
         center = QPointF(window.width() / 2, window.height() / 2)
         global_center = QPointF(window.mapToGlobal(center.toPoint()))
 
@@ -352,9 +370,15 @@ class Probe(QObject):
         """Evaluate JavaScript in the QML root context."""
         from PySide6.QtQml import QQmlExpression
 
-        root = self._engine.rootObjects()[0]
-        ctx = self._engine.rootContext()
-        expr = QQmlExpression(ctx, root, expression)
+        try:
+            root = self._window
+            ctx = self._engine.rootContext()
+            expr = QQmlExpression(ctx, root, expression)
+        except RuntimeError:
+            self._invalidate_window()
+            root = self._window
+            ctx = self._engine.rootContext()
+            expr = QQmlExpression(ctx, root, expression)
         result = expr.evaluate()
         if expr.hasError():
             return {"error": expr.error().toString()}
@@ -376,7 +400,7 @@ class Probe(QObject):
                 raise ValueError(f"Unknown context property: {parts[0]}")
             val = service.property(parts[1])
         else:
-            root = self._engine.rootObjects()[0]
+            root = self._window
             val = root.property(parts[0])
         return {"value": _json_safe(val)}
 
@@ -418,8 +442,11 @@ class Probe(QObject):
 
     def status(self) -> dict:
         """Connection check and basic window info."""
-        window = self._root_window()
-        root = self._engine.rootObjects()[0]
+        try:
+            window = self._window
+        except RuntimeError:
+            self._invalidate_window()
+            window = self._window
         return {
             "connected": True,
             "window_size": f"{window.width()}x{window.height()}",
