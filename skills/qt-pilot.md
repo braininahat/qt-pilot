@@ -12,31 +12,51 @@ qt-pilot lets you interact with a running PySide6/QML application through a CLI,
 The target app must have qt-pilot installed and the probe enabled:
 
 ```bash
-# Start the app with the probe
-QT_PILOT=1 python my_app.py
-# or
 QT_PILOT=1 uv run my-app
 ```
 
 ## Core Workflow
 
-Every interaction follows this pattern:
+**This is an interactive tool, not a scripting framework.** Each command is a separate Bash tool call. You read the output, think about what to do next, then run the next command.
 
-1. **Snapshot**: `qt-pilot snapshot -i` (get element refs like `@e1`, `@e2`)
-2. **Interact**: Use refs to click, fill, type
-3. **Re-snapshot**: After navigation or state changes, get fresh refs
+```
+1. Snapshot    →  see what's on screen, get @refs
+2. Think       →  decide what to interact with
+3. Act         →  click, fill, type, eval
+4. Re-snapshot →  observe the result
+5. Repeat
+```
+
+**Never chain multiple qt-pilot commands in one Bash call.** Each command should be its own tool call so you can read the result before deciding the next action.
+
+### Example: Login flow
 
 ```bash
+# Step 1: See what's on screen
 qt-pilot snapshot -i
-# Output: @e1 [TextField] placeholder="Username" (440,340 400x44)
-#         @e2 [TextField] placeholder="Password" (440,400 400x44)
-#         @e3 [Button] "Sign In" (440,460 400x44)
-
-qt-pilot fill @e1 "admin"
-qt-pilot fill @e2 "password123"
-qt-pilot click @e3
-qt-pilot snapshot -i  # Re-snapshot after navigation
 ```
+Output: `@e1 [TextField] "Username" ... @e2 [TextField] "Password" ... @e3 [Button] "Sign In"`
+
+```bash
+# Step 2: Fill username
+qt-pilot fill @e1 "admin"
+```
+
+```bash
+# Step 3: Fill password
+qt-pilot fill @e2 "password"
+```
+
+```bash
+# Step 4: Click sign in
+qt-pilot click @e3
+```
+
+```bash
+# Step 5: See what happened
+qt-pilot snapshot -i
+```
+Output: `[page: dashboard] @e1 [Button] "Start Session" ...` — login worked.
 
 ## Commands
 
@@ -49,11 +69,10 @@ qt-pilot snapshot -i           # interactive elements only (recommended)
 
 Output format:
 ```
-[page: login] [window: 1280x800]
-@e1 [TextField] "Username" (440,340 400x44) [focused]
-@e2 [TextField] "Password" (440,400 400x44)
-@e3 [Button] "Sign In" (440,460 400x44)
-  [Text] "UltraSpeech" (540,180)
+[page: dashboard] [window: 1280x800]
+@e1 [Button] "Start Session" (1098,107 150x44)
+@e2 [Button] "View All" (1144,421 80x46)
+  [Text] "Welcome back, admin" (30,90)
 ```
 
 ### Screenshot
@@ -62,10 +81,9 @@ Output format:
 qt-pilot screenshot                     # save to temp file, print path
 qt-pilot screenshot ./shot.png          # save to specified path
 qt-pilot screenshot --annotate          # with numbered badges on elements
-qt-pilot screenshot -a ./annotated.png  # annotated to specified path
 ```
 
-Use annotated screenshots when you need visual context about element positions.
+Use screenshots when you need visual context (layout verification, checking colors, reading non-interactive text). Use snapshot for element discovery and interaction.
 
 ### Interaction
 
@@ -77,21 +95,15 @@ qt-pilot press Enter              # press key
 qt-pilot press Tab                # tab to next field
 qt-pilot press Ctrl+A             # key with modifier
 qt-pilot scroll down 300          # scroll window
-qt-pilot scroll up 500
 ```
 
 ### QML Expression Evaluation
 
+For app-specific actions that don't map to UI elements:
+
 ```bash
-# Call QML functions on the root object
 qt-pilot eval "navigateTo('patients')"
-
-# Call service methods (exposed as QML context properties)
 qt-pilot eval "Auth.login('admin', 'password')"
-qt-pilot eval "Patients.create('John', '2000-01-01', 'IRB-001')"
-
-# Read values
-qt-pilot eval "Auth.currentUsername"
 ```
 
 ### Property Access
@@ -99,106 +111,43 @@ qt-pilot eval "Auth.currentUsername"
 ```bash
 qt-pilot get @e1 text             # read element property
 qt-pilot get @e1 enabled
-qt-pilot get @e1 checked
-
-qt-pilot get-context Auth.loggedIn           # read service property
-qt-pilot get-context window.currentPage      # root object property
+qt-pilot get-context Auth.loggedIn
+qt-pilot get-context window.currentPage
 ```
 
 ### Wait
 
 ```bash
-qt-pilot wait @e1                 # wait for element to appear (5s timeout)
-qt-pilot wait @e1 --timeout 10000  # custom timeout
+qt-pilot wait @e1                 # wait for element to appear
 qt-pilot wait 2000                # wait 2 seconds
 ```
 
 ### Status
 
 ```bash
-qt-pilot status
-# connected: True
-# window_size: 1280x800
-# root_class: ApplicationWindow
-# current_page: dashboard
+qt-pilot status                   # connection check + window info
 ```
-
-## Command Chaining
-
-Commands can be chained with `&&` in a single shell call:
-
-```bash
-qt-pilot fill @e1 "admin" && qt-pilot fill @e2 "pass" && qt-pilot click @e3
-```
-
-Chain when you don't need intermediate output. Run separately when you need to parse snapshot output to discover refs.
 
 ## Ref Lifecycle
 
-Refs (`@e1`, `@e2`, etc.) are invalidated when the QML tree changes. Always re-snapshot after:
+Refs (`@e1`, `@e2`) are invalidated when the QML tree changes. **Always re-snapshot after:**
 
-- Page navigation
-- Dialog open/close
-- Dynamic content loading
-- Form submission that changes the view
-
-```bash
-qt-pilot click @e3              # navigates to new page
-qt-pilot snapshot -i            # MUST re-snapshot
-qt-pilot click @e1              # use new refs
-```
-
-## Common Patterns
-
-### Login Flow
-
-```bash
-qt-pilot snapshot -i
-qt-pilot fill @e1 "username"
-qt-pilot fill @e2 "password"
-qt-pilot click @e3
-qt-pilot wait 1000
-qt-pilot snapshot -i              # check result
-```
-
-### Navigate and Explore
-
-```bash
-qt-pilot eval "navigateTo('patients')"
-qt-pilot wait 500
-qt-pilot snapshot -i
-qt-pilot screenshot --annotate
-```
-
-### Visual Verification
-
-```bash
-qt-pilot screenshot --annotate ./before.png
-qt-pilot click @e1
-qt-pilot wait 500
-qt-pilot screenshot --annotate ./after.png
-```
+- Clicking a button that navigates
+- Opening/closing dialogs
+- Any action that changes the visible UI
 
 ## Port Configuration
 
-Default port: 9718. Override with:
-
 ```bash
-# App side
-QT_PILOT_PORT=9999 QT_PILOT=1 python my_app.py
-
-# CLI side
-qt-pilot --port 9999 status
-# or
-QT_PILOT_PORT=9999 qt-pilot status
+QT_PILOT_PORT=9999 QT_PILOT=1 uv run my-app   # app side
+qt-pilot --port 9999 status                      # CLI side
 ```
 
 ## Troubleshooting
 
 | Issue | Solution |
 |-------|----------|
-| "cannot connect to qt-pilot probe" | Is the app running with `QT_PILOT=1`? |
+| "cannot connect to probe" | App not running with `QT_PILOT=1` |
 | Refs not found | Re-snapshot — refs expire on tree changes |
-| Click does nothing | Check `qt-pilot get @eN enabled` — element may be disabled |
-| Fill doesn't type | The element may not accept keyboard input; try `qt-pilot type` instead |
-| Empty snapshot | The QML tree may not be loaded yet; `qt-pilot wait 1000` then retry |
+| Click does nothing | Check `qt-pilot get @eN enabled` |
+| Duplicate refs | StackView artifact — use the refs with `[focused]` |
