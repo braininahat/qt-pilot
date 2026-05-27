@@ -78,7 +78,34 @@ def cmd_screenshot(args: argparse.Namespace) -> None:
 
 
 def cmd_click(args: argparse.Namespace) -> None:
-    _rpc("click", port=_port(args), ref=args.ref)
+    target = args.target
+    if len(target) == 1:
+        ref = target[0]
+        if not ref.startswith("@"):
+            print(
+                f"Error: ref must start with '@' (got {ref!r}). "
+                "Use '@eN' for snapshot refs or '@objectName' for QML-named items.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        _rpc("click", port=_port(args), ref=ref)
+    elif len(target) == 2:
+        try:
+            x = int(target[0])
+            y = int(target[1])
+        except ValueError:
+            print(
+                f"Error: coordinate click takes two integers, got {target!r}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        _rpc("click_coord", port=_port(args), x=x, y=y)
+    else:
+        print(
+            f"Error: click takes 1 ref or 2 coords, got {len(target)} args: {target!r}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 def cmd_fill(args: argparse.Namespace) -> None:
@@ -176,8 +203,15 @@ def main() -> None:
     p.set_defaults(func=cmd_screenshot)
 
     # click
-    p = sub.add_parser("click", help="click an element")
-    p.add_argument("ref", help="element ref (e.g., @e1)")
+    p = sub.add_parser(
+        "click",
+        help="click an element by @ref, @objectName, or x y coords",
+    )
+    p.add_argument(
+        "target", nargs="+",
+        help="@eN (snapshot ref), @objectName (QML-named item), "
+             "or two ints (window x y coords)",
+    )
     p.set_defaults(func=cmd_click)
 
     # fill

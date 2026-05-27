@@ -10,6 +10,7 @@ from typing import Any
 from PySide6.QtCore import (
     QEvent,
     QObject,
+    QPoint,
     QPointF,
     QRectF,
     Qt,
@@ -240,14 +241,75 @@ class Probe(QObject):
         return result
 
     # ------------------------------------------------------------------
+    # Ref resolution — registry (@e1) + objectName (@signInButton) lookup
+    # ------------------------------------------------------------------
+
+    def _resolve_ref(self, ref: str) -> QQuickItem:
+        """Resolve a ref to a QQuickItem.
+
+        Tries the snapshot registry first (auto-generated refs like @e1, @e2).
+        Falls back to walking the QML tree for visible items where
+        `objectName` matches the ref. Raises ValueError if neither matches.
+        """
+        obj = self._registry.resolve(ref)
+        if obj is not None and isValid(obj):
+            if not isinstance(obj, QQuickItem):
+                raise ValueError(f"Ref {ref} is not a QQuickItem")
+            return obj
+
+        if not ref.startswith("@"):
+            raise ValueError(f"Ref must start with '@', got {ref!r}")
+        name = ref[1:]
+        if not name:
+            raise ValueError(f"Empty ref {ref!r}")
+
+        found = self._find_by_object_name(name)
+        if found is not None:
+            return found
+
+        raise ValueError(
+            f"Ref {ref} not found — not in current registry "
+            f"(generation {self._registry.generation}) "
+            f"and no visible QML item with objectName={name!r}. "
+            f"Run `qt-pilot snapshot` to refresh @eN refs, or set "
+            f"objectName on the QML element."
+        )
+
+    def _find_by_object_name(self, name: str) -> QQuickItem | None:
+        """Return the first visible QQuickItem with matching objectName, or None."""
+        try:
+            window = self._window
+        except RuntimeError:
+            self._invalidate_window()
+            window = self._window
+        found: list[QQuickItem] = []
+        self._walk_for_object_name(window.contentItem(), name, found)
+        return found[0] if found else None
+
+    def _walk_for_object_name(self, item: QQuickItem, name: str,
+                              found: list[QQuickItem]) -> None:
+        if found or not isValid(item):
+            return
+        try:
+            if item.objectName() == name:
+                if item.isVisible() and item.width() > 0 and item.height() > 0:
+                    found.append(item)
+                    return
+            children = item.childItems()
+        except RuntimeError:
+            return
+        for child in children:
+            if found:
+                return
+            self._walk_for_object_name(child, name, found)
+
+    # ------------------------------------------------------------------
     # Interaction
     # ------------------------------------------------------------------
 
     def click(self, ref: str) -> dict:
-        """Click the center of an element."""
-        item = self._registry.resolve_or_raise(ref)
-        if not isinstance(item, QQuickItem):
-            raise ValueError(f"Ref {ref} is not a QQuickItem")
+        """Click the center of an element (by @eN ref or @objectName)."""
+        item = self._resolve_ref(ref)
         window = item.window()
         if window is None:
             raise RuntimeError(f"Item for {ref} has no window")
@@ -261,11 +323,26 @@ class Probe(QObject):
         QApplication.processEvents()
         return {"ok": True}
 
+    def click_coord(self, x: int, y: int) -> dict:
+        """Click at window-relative coordinates (x, y).
+
+        Fallback for elements that have no @eN ref (custom-drawn cards,
+        Rectangle+MouseArea widgets, canvas areas).
+        """
+        try:
+            window = self._window
+        except RuntimeError:
+            self._invalidate_window()
+            window = self._window
+        point = QPoint(int(x), int(y))
+        QTest.mouseClick(window, Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier, point)
+        QApplication.processEvents()
+        return {"ok": True}
+
     def fill(self, ref: str, text: str) -> dict:
         """Clear field and type text."""
-        item = self._registry.resolve_or_raise(ref)
-        if not isinstance(item, QQuickItem):
-            raise ValueError(f"Ref {ref} is not a QQuickItem")
+        item = self._resolve_ref(ref)
         window = item.window()
         if window is None:
             raise RuntimeError(f"Item for {ref} has no window")
@@ -294,9 +371,7 @@ class Probe(QObject):
 
     def type_text(self, ref: str, text: str) -> dict:
         """Type text without clearing first."""
-        item = self._registry.resolve_or_raise(ref)
-        if not isinstance(item, QQuickItem):
-            raise ValueError(f"Ref {ref} is not a QQuickItem")
+        item = self._resolve_ref(ref)
         window = item.window()
         if window is None:
             raise RuntimeError(f"Item for {ref} has no window")
@@ -320,9 +395,7 @@ class Probe(QObject):
     def press(self, key: str, ref: str | None = None) -> dict:
         """Press a key (e.g., 'Enter', 'Tab', 'Escape', 'Ctrl+A')."""
         if ref:
-            item = self._registry.resolve_or_raise(ref)
-            if not isinstance(item, QQuickItem):
-                raise ValueError(f"Ref {ref} is not a QQuickItem")
+            item = self._resolve_ref(ref)
             window = item.window()
             item.forceActiveFocus()
         else:
@@ -386,7 +459,7 @@ class Probe(QObject):
 
     def get_property(self, ref: str, prop: str) -> dict:
         """Read a property from a ref'd QML item."""
-        item = self._registry.resolve_or_raise(ref)
+        item = self._resolve_ref(ref)
         val = item.property(prop)
         return {"value": _json_safe(val)}
 
@@ -420,15 +493,20 @@ class Probe(QObject):
             return {"ok": True, "elapsed_ms": ms}
 
         if ref is not None:
-            # Wait for element with matching ref to appear in a new snapshot
+            # Wait for element with matching ref to appear. Accepts @eN
+            # (registry) or @objectName (tree walk). Both are re-checked
+            # each tick after a fresh snapshot.
             start = time.monotonic()
             deadline = start + timeout / 1000.0
             while time.monotonic() < deadline:
                 QApplication.processEvents()
                 self.snapshot(interactive_only=True)
-                if self._registry.resolve(ref) is not None:
+                try:
+                    self._resolve_ref(ref)
                     elapsed = int((time.monotonic() - start) * 1000)
                     return {"ok": True, "elapsed_ms": elapsed}
+                except ValueError:
+                    pass
                 time.sleep(WAIT_POLL_MS / 1000.0)
             raise TimeoutError(
                 f"Timed out after {timeout}ms waiting for {ref}"
@@ -450,8 +528,8 @@ class Probe(QObject):
         return {
             "connected": True,
             "window_size": f"{window.width()}x{window.height()}",
-            "root_class": root.metaObject().className(),
-            "current_page": root.property("currentPage") or None,
+            "root_class": window.metaObject().className(),
+            "current_page": window.property("currentPage") or None,
             "visible": window.isVisible(),
         }
 

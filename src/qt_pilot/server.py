@@ -117,6 +117,7 @@ class PilotServer(QObject):
             "snapshot": lambda: self._probe.snapshot(**params),
             "screenshot": lambda: self._probe.screenshot(**params),
             "click": lambda: self._probe.click(**params),
+            "click_coord": lambda: self._probe.click_coord(**params),
             "fill": lambda: self._probe.fill(**params),
             "type_text": lambda: self._probe.type_text(**params),
             "press": lambda: self._probe.press(**params),
